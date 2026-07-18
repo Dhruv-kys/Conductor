@@ -1,23 +1,28 @@
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 
-from app.db import get_db
+from app.redis_client import redis_client
 from app.schemas import JobCreate, JobOut, JobStatus
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
-def _row_to_job(row) -> JobOut:
+def _job_key(job_id: str) -> str:
+    return f"job:{job_id}"
+
+
+def _hash_to_job(data: dict) -> JobOut:
     return JobOut(
-        id=row["id"],
-        payload=json.loads(row["payload"]),
-        status=row["status"],
-        priority=row["priority"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
+        id=data["id"],
+        payload=json.loads(data["payload"]),
+        status=data["status"],
+        priority=int(data["priority"]),
+        created_at=data["created_at"],
+        updated_at=data["updated_at"],
     )
 
 
@@ -26,14 +31,20 @@ def create_job(job: JobCreate) -> JobOut:
     job_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
-    with get_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO jobs (id, payload, status, priority, created_at, updated_at)
-            VALUES (?, ?, 'pending', ?, ?, ?)
-            """,
-            (job_id, json.dumps(job.payload), job.priority, now, now),
-        )
+    fields = {
+        "id": job_id,
+        "payload": json.dumps(job.payload),
+        "status": "pending",
+        "priority": job.priority,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    pipe = redis_client.pipeline()
+    pipe.hset(_job_key(job_id), mapping=fields)
+    pipe.zadd("jobs:pending", {job_id: job.priority})
+    pipe.zadd("jobs:all", {job_id: time.time()})
+    pipe.execute()
 
     return JobOut(
         id=job_id,
@@ -47,23 +58,25 @@ def create_job(job: JobCreate) -> JobOut:
 
 @router.get("/{job_id}", response_model=JobOut)
 def get_job(job_id: str) -> JobOut:
-    with get_db() as conn:
-        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    data = redis_client.hgetall(_job_key(job_id))
 
-    if row is None:
+    if not data:
         raise HTTPException(status_code=404, detail="job not found")
 
-    return _row_to_job(row)
+    return _hash_to_job(data)
 
 
 @router.get("", response_model=list[JobOut])
 def list_jobs(status: JobStatus | None = None) -> list[JobOut]:
-    with get_db() as conn:
-        if status is not None:
-            rows = conn.execute(
-                "SELECT * FROM jobs WHERE status = ? ORDER BY created_at DESC", (status,)
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC").fetchall()
+    job_ids = redis_client.zrevrange("jobs:all", 0, -1)
 
-    return [_row_to_job(row) for row in rows]
+    jobs = []
+    for job_id in job_ids:
+        data = redis_client.hgetall(_job_key(job_id))
+        if not data:
+            continue
+        job = _hash_to_job(data)
+        if status is None or job.status == status:
+            jobs.append(job)
+
+    return jobs
